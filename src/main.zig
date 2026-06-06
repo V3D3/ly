@@ -316,13 +316,18 @@ pub fn main(init: std.process.Init) !void {
         var file_reader = save_file.reader(state.io, &file_buffer);
         var reader = &file_reader.interface;
 
-        const last_username_index_str = reader.takeDelimiterInclusive('\n') catch break :read_save_file;
-        state.saved_users.last_username_index = std.fmt.parseInt(usize, last_username_index_str[0..(last_username_index_str.len - 1)], 10) catch break :read_save_file;
+        const last_username_str = reader.takeDelimiterInclusive('\n') catch break :read_save_file;
+        const last_username_trimmed = std.mem.trimRight(u8, last_username_str, "\n\r");
+        if (last_username_trimmed.len > 0) {
+            state.saved_users.last_username = try state.allocator.dupe(u8, last_username_trimmed);
+        }
 
         while (reader.seek < reader.buffer.len) {
             const line = reader.takeDelimiterInclusive('\n') catch break;
+            const trimmed_line = std.mem.trimRight(u8, line, "\n\r");
+            if (trimmed_line.len == 0) continue;
 
-            var user = std.mem.splitScalar(u8, line[0..(line.len - 1)], ':');
+            var user = std.mem.splitScalar(u8, trimmed_line, ':');
             const username = user.next() orelse continue;
             const session_index_str = user.next() orelse continue;
 
@@ -1120,24 +1125,25 @@ pub fn main(init: std.process.Init) !void {
     var default_input = state.config.default_input;
 
     if (state.config.save and !state.is_autologin) {
-        if (state.saved_users.last_username_index) |index| load_last_user: {
-            // If the saved index isn't valid, bail out
-            if (index >= state.saved_users.user_list.items.len) break :load_last_user;
-
-            const user = state.saved_users.user_list.items[index];
-
+        if (state.saved_users.last_username) |last_username| load_last_user: {
             // Find user with saved name, and switch over to it
             // If it doesn't exist (anymore), we don't change the value
             for (usernames.items, 0..) |username, i| {
-                if (std.mem.eql(u8, username, user.username)) {
+                if (std.mem.eql(u8, username, last_username)) {
                     state.login.label.current = i;
-                    break;
+
+                    // Set saved session index for this user
+                    for (state.saved_users.user_list.items) |saved_user| {
+                        if (std.mem.eql(u8, saved_user.username, last_username)) {
+                            state.session.label.current = @min(saved_user.session_index, state.session.label.list.items.len - 1);
+                            break;
+                        }
+                    }
+
+                    default_input = .password;
+                    break :load_last_user;
                 }
             }
-
-            default_input = .password;
-
-            state.session.label.current = @min(user.session_index, state.session.label.list.items.len - 1);
         }
     }
 
@@ -1535,9 +1541,9 @@ fn authenticate(ptr: *anyopaque) !bool {
         var file_writer = file.writer(state.io, &file_buffer);
         var writer = &file_writer.interface;
 
-        try writer.print("{d}\n", .{state.login.label.current});
-        for (state.saved_users.user_list.items) |user| {
-            try writer.print("{s}:{d}\n", .{ user.username, user.session_index });
+        try writer.print("{s}\n", .{state.login.getCurrentUsername()});
+        for (state.login.label.list.items) |user| {
+            try writer.print("{s}:{d}\n", .{ user.name, user.session_index.* });
         }
         try writer.flush();
 

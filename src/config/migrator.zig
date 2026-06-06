@@ -262,12 +262,17 @@ pub fn tryMigrateIniSaveFile(allocator: std.mem.Allocator, io: std.Io, path: []c
     const maybe_save = if (save_parser.maybe_load_error == null) save_parser.structure else tryMigrateFirstSaveFile(io, &user_buf);
 
     if (maybe_save) |save| {
-        // Add all other users to the list
-        for (usernames, 0..) |username, i| {
-            if (save.user) |user| {
-                if (std.mem.eql(u8, user, username)) saved_users.last_username_index = i;
+        if (save.user) |user| {
+            for (usernames) |username| {
+                if (std.mem.eql(u8, user, username)) {
+                    saved_users.last_username = try allocator.dupe(u8, username);
+                    break;
+                }
             }
+        }
 
+        // Add all other users to the list
+        for (usernames) |username| {
             try saved_users.user_list.append(allocator, .{
                 .username = username,
                 .session_index = save.session_index orelse 0,
