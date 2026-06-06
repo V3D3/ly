@@ -6,6 +6,7 @@
 authenticating: []const u8 = "authenticating...",
 brightness_down: []const u8 = "decrease brightness",
 brightness_up: []const u8 = "increase brightness",
+animation: []const u8 = "cycle animation",
 capslock: []const u8 = "capslock",
 custom: []const u8 = "custom",
 custom_info_err_output_long: []const u8 = "output too long",

@@ -39,7 +39,9 @@ const migrator = @import("config/migrator.zig");
 const OldSave = @import("config/OldSave.zig");
 const SavedUsers = @import("config/SavedUsers.zig");
 const custom = @import("config/custom.zig");
-const DisplayServer = @import("enums.zig").DisplayServer;
+const enums = @import("enums.zig");
+const Animation = enums.Animation;
+const DisplayServer = enums.DisplayServer;
 const Environment = @import("Environment.zig");
 const Entry = Environment.Entry;
 
@@ -92,6 +94,9 @@ const UiState = struct {
     toggle_password_label: Label,
     brightness_down_label: Label,
     brightness_up_label: Label,
+    animation_label: Label,
+    animation_widget: ?*Widget,
+    animation_wrapper: Widget,
     numlock_label: Label,
     capslock_label: Label,
     battery_label: Label,
@@ -125,6 +130,7 @@ const UiState = struct {
     bigclock_buf: [32:0]u8,
     custom_binds: std.ArrayList(CustomBindLabel),
     custom_info: std.ArrayList(CustomInfoLabel),
+    prng: std.Random.DefaultPrng,
 };
 
 var shutdown = false;
@@ -399,8 +405,8 @@ pub fn main(init: std.process.Init) !void {
     var seed: u64 = undefined;
     state.io.random(std.mem.asBytes(&seed)); // Get a random seed for the PRNG (used by animations)
 
-    var prng = std.Random.DefaultPrng.init(seed);
-    const random = prng.random();
+    state.prng = std.Random.DefaultPrng.init(seed);
+    const random = state.prng.random();
 
     const buffer_options = TerminalBuffer.InitOptions{
         .fg = state.config.fg,
@@ -499,6 +505,29 @@ pub fn main(init: std.process.Init) !void {
     );
     defer state.brightness_up_label.deinit();
 
+    state.animation_label = Label.init(
+        "",
+        null,
+        state.buffer.fg,
+        state.buffer.bg,
+        null,
+        null,
+    );
+    defer state.animation_label.deinit();
+
+    state.animation_widget = null;
+    state.animation_wrapper = Widget.init(
+        "AnimationWrapper",
+        null,
+        &state,
+        null,
+        reallocAnimation,
+        drawAnimation,
+        updateAnimation,
+        null,
+        calculateAnimationTimeout,
+    );
+
     if (!state.config.hide_key_hints) {
         try state.shutdown_label.setTextAlloc(
             state.allocator,
@@ -543,6 +572,11 @@ pub fn main(init: std.process.Init) !void {
                 .{ key, state.lang.brightness_up },
             );
         }
+        try state.animation_label.setTextAlloc(
+            state.allocator,
+            "{s} {s}",
+            .{ state.config.animation_key, state.lang.animation },
+        );
     }
 
     state.numlock_label = Label.init(
@@ -1028,83 +1062,10 @@ pub fn main(init: std.process.Init) !void {
     }
 
     // Initialize the animation, if any
-    var animation: ?*Widget = null;
-    switch (state.config.animation) {
-        .none => {},
-        .doom => {
-            var doom = try Doom.init(
-                state.allocator,
-                &state.buffer,
-                state.config.doom_top_color,
-                state.config.doom_middle_color,
-                state.config.doom_bottom_color,
-                state.config.doom_fire_height,
-                state.config.doom_fire_spread,
-                &state.animate,
-                state.config.animation_timeout_sec,
-                state.config.animation_frame_delay,
-            );
-            animation = doom.widget();
-        },
-        .matrix => {
-            var matrix = try Matrix.init(
-                state.allocator,
-                &state.buffer,
-                state.config.cmatrix_fg,
-                state.config.cmatrix_head_col,
-                state.config.cmatrix_min_codepoint,
-                state.config.cmatrix_max_codepoint,
-                &state.animate,
-                state.config.animation_timeout_sec,
-                state.config.animation_frame_delay,
-            );
-            animation = matrix.widget();
-        },
-        .colormix => {
-            var color_mix = try ColorMix.init(
-                &state.buffer,
-                state.config.colormix_col1,
-                state.config.colormix_col2,
-                state.config.colormix_col3,
-                &state.animate,
-                state.config.animation_timeout_sec,
-                state.config.animation_frame_delay,
-            );
-            animation = color_mix.widget();
-        },
-        .gameoflife => {
-            var game_of_life = try GameOfLife.init(
-                state.allocator,
-                &state.buffer,
-                state.config.gameoflife_fg,
-                state.config.gameoflife_entropy_interval,
-                state.config.gameoflife_frame_delay,
-                state.config.gameoflife_initial_density,
-                &state.animate,
-                state.config.animation_timeout_sec,
-                state.config.animation_frame_delay,
-            );
-            animation = game_of_life.widget();
-        },
-        .dur_file => {
-            var dur = try DurFile.init(
-                state.allocator,
-                state.io,
-                &state.buffer,
-                &state.log_file,
-                state.config.dur_file_path,
-                state.config.dur_offset_alignment,
-                state.config.dur_x_offset,
-                state.config.dur_y_offset,
-                state.config.full_color,
-                &state.animate,
-                state.config.animation_timeout_sec,
-                state.config.animation_frame_delay,
-            );
-            animation = dur.widget();
-        },
-    }
-    defer if (animation) |a| a.deinit();
+    try initAnimation(&state);
+    // Note: state.animation_widget is deinitialized inside initAnimation when cycling,
+    // and the last one is deinitialized by this defer.
+    defer if (state.animation_widget) |a| a.deinit();
 
     var cascade = Cascade.init(
         state.io,
@@ -1155,10 +1116,8 @@ pub fn main(init: std.process.Init) !void {
     defer widgets.deinit(state.allocator);
 
     // Layer 1
-    if (animation) |a| {
-        var layer1 = [_]*Widget{a};
-        try widgets.append(state.allocator, &layer1);
-    }
+    var layer1 = [_]*Widget{&state.animation_wrapper};
+    try widgets.append(state.allocator, &layer1);
 
     // Layer 2
     var layer2: std.ArrayList(*Widget) = .empty;
@@ -1231,6 +1190,7 @@ pub fn main(init: std.process.Init) !void {
         if (state.config.brightness_up_key != null) {
             try layer2.append(state.allocator, state.brightness_up_label.widget());
         }
+        try layer2.append(state.allocator, state.animation_label.widget());
     }
     if (state.config.battery_id != null) {
         try layer2.append(state.allocator, state.battery_label.widget());
@@ -1296,6 +1256,7 @@ pub fn main(init: std.process.Init) !void {
     if (state.config.hibernate_cmd != null) try state.buffer.registerGlobalKeybind(state.io, state.config.hibernate_key, &hibernateCmd, &state);
     if (state.config.brightness_down_key) |key| try state.buffer.registerGlobalKeybind(state.io, key, &decreaseBrightnessCmd, &state);
     if (state.config.brightness_up_key) |key| try state.buffer.registerGlobalKeybind(state.io, key, &increaseBrightnessCmd, &state);
+    try state.buffer.registerGlobalKeybind(state.io, state.config.animation_key, &cycleAnimation, &state);
 
     if (state.config.initial_info_text) |text| {
         try state.info_line.addMessage(text, state.config.bg, state.config.fg);
@@ -1346,6 +1307,125 @@ pub fn main(init: std.process.Init) !void {
         handleInactivity,
         &state,
     );
+}
+
+fn initAnimation(state: *UiState) !void {
+    if (state.animation_widget) |a| {
+        a.deinit();
+        state.animation_widget = null;
+    }
+
+    switch (state.config.animation) {
+        .none => {},
+        .doom => {
+            var doom = try Doom.init(
+                state.allocator,
+                &state.buffer,
+                state.config.doom_top_color,
+                state.config.doom_middle_color,
+                state.config.doom_bottom_color,
+                state.config.doom_fire_height,
+                state.config.doom_fire_spread,
+                &state.animate,
+                state.config.animation_timeout_sec,
+                state.config.animation_frame_delay,
+            );
+            state.animation_widget = doom.widget();
+        },
+        .matrix => {
+            var matrix = try Matrix.init(
+                state.allocator,
+                &state.buffer,
+                state.config.cmatrix_fg,
+                state.config.cmatrix_head_col,
+                state.config.cmatrix_min_codepoint,
+                state.config.cmatrix_max_codepoint,
+                &state.animate,
+                state.config.animation_timeout_sec,
+                state.config.animation_frame_delay,
+            );
+            state.animation_widget = matrix.widget();
+        },
+        .colormix => {
+            var color_mix = try ColorMix.init(
+                &state.buffer,
+                state.config.colormix_col1,
+                state.config.colormix_col2,
+                state.config.colormix_col3,
+                &state.animate,
+                state.config.animation_timeout_sec,
+                state.config.animation_frame_delay,
+            );
+            state.animation_widget = color_mix.widget();
+        },
+        .gameoflife => {
+            var game_of_life = try GameOfLife.init(
+                state.allocator,
+                &state.buffer,
+                state.config.gameoflife_fg,
+                state.config.gameoflife_entropy_interval,
+                state.config.gameoflife_frame_delay,
+                state.config.gameoflife_initial_density,
+                &state.animate,
+                state.config.animation_timeout_sec,
+                state.config.animation_frame_delay,
+            );
+            state.animation_widget = game_of_life.widget();
+        },
+        .dur_file => {
+            var dur = try DurFile.init(
+                state.allocator,
+                state.io,
+                &state.buffer,
+                &state.log_file,
+                state.config.dur_file_path,
+                state.config.dur_offset_alignment,
+                state.config.dur_x_offset,
+                state.config.dur_y_offset,
+                state.config.full_color,
+                &state.animate,
+                state.config.animation_timeout_sec,
+                state.config.animation_frame_delay,
+            );
+            state.animation_widget = dur.widget();
+        },
+    }
+}
+
+fn cycleAnimation(ptr: *anyopaque) !bool {
+    var state: *UiState = @ptrCast(@alignCast(ptr));
+    const animation_count = @typeInfo(Animation).@"enum".fields.len;
+    const next_idx = (@intFromEnum(state.config.animation) + 1) % animation_count;
+    state.config.animation = @enumFromInt(next_idx);
+    state.animate = state.config.animation != .none;
+
+    // Reset PRNG for animations that need it
+    var seed: u64 = undefined;
+    state.io.random(std.mem.asBytes(&seed));
+    state.prng = std.Random.DefaultPrng.init(seed);
+    state.buffer.random = state.prng.random();
+
+    try initAnimation(state);
+
+    state.buffer.drawNextFrame(true);
+    return false;
+}
+
+fn drawAnimation(state: *UiState) void {
+    if (state.animation_widget) |a| a.draw();
+}
+
+fn updateAnimation(state: *UiState, ctx: *anyopaque) anyerror!void {
+    if (state.animation_widget) |a| try a.update(ctx);
+}
+
+fn calculateAnimationTimeout(state: *UiState, ctx: *anyopaque) anyerror!?usize {
+    if (state.animation_widget) |a| return try a.calculateTimeout(ctx);
+    return null;
+}
+
+fn reallocAnimation(state: *UiState) anyerror!void {
+    if (state.animation_widget) |a| try a.realloc();
 }
 
 fn maxWidths(labels: [][]const u8) usize {
@@ -2031,6 +2111,10 @@ fn positionWidgets(ptr: *anyopaque) !void {
             last_label = state.brightness_down_label;
         }
         state.brightness_up_label.positionXY(last_label
+            .childrenPosition()
+            .addX(1));
+        last_label = state.brightness_up_label;
+        state.animation_label.positionXY(last_label
             .childrenPosition()
             .addX(1));
         for (state.custom_binds.items) |*item| {
